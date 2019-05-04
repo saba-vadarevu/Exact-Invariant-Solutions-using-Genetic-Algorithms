@@ -1,0 +1,204 @@
+#%%writefile eval.py
+import numpy as np
+from lib import pseudo
+from lib.utils import qdot_vm, qdot_mv, qnorm, calcDerivatives
+from lib.utils import _kxFun, _kzFun, _dealiasFun
+from warnings import warn
+
+def getLinTerm(state, kxArr, kzArr, flowDict,derivs=None):
+    """
+    Returns linear terms in NSE for each Fourier mode
+    Arguments:
+        Positional:
+        state: shape (2L, M+1, 4, N). First 2 indices are sizes of kxArr and kzArr, then field index (u,v,w,p).
+        kxArr : streamwise wavenumber set
+        kzArr : spanwise wavenumber set
+        flowDict: dict with keys: 
+                Re: Reynolds number (float)
+                U, U': Mean velocity and its first derivative
+                y, D1, D2: Wall-normal nodes and differentiation matrices
+    Outputs:
+        L: array of shape (2L, M+1, 4, N), the linear terms in the NSE
+    """
+    U = flowDict['U']
+    Uy= flowDict['Uy']
+    Re = flowDict['Re']
+    state = state.reshape((kxArr.size, kzArr.size, 4, -1))
+   
+    if derivs is None :
+        xd, yd, zd = calcDerivatives(state, kxArr, kzArr, flowDict=flowDict)
+        warn("Calculating derivs in getLinTerm.")
+    else :
+        xd, yd, zd = derivs
+    u  = xd[:,:,0,0]; v  = xd[:,:,0,1]; w  = xd[:,:,0,2]
+    ux = xd[:,:,1,0]; vx = xd[:,:,1,1]; wx = xd[:,:,1,2]; px= xd[:,:,1,3]
+    uxx= xd[:,:,2,0]; vxx= xd[:,:,2,1]; wxx= xd[:,:,2,2]; 
+    
+    uy = yd[:,:,1,0]; vy = yd[:,:,1,1]; wy = yd[:,:,1,2]; py= yd[:,:,1,3]
+    uyy= yd[:,:,2,0]; vyy= yd[:,:,2,1]; wyy= yd[:,:,2,2]; 
+    
+    uz = zd[:,:,1,0]; vz = zd[:,:,1,1]; wz = zd[:,:,1,2]; pz= zd[:,:,1,3]
+    uzz= zd[:,:,2,0]; vzz= zd[:,:,2,1]; wzz= zd[:,:,2,2]; 
+    
+    L0123 = np.zeros((state.shape), dtype=np.complex) 
+    
+    L0123[:,:,0] =  -U *ux - v*Uy  -px + (1./Re)*( uxx + uyy + uzz  )
+    L0123[:,:,1] =  -U *vx         -py + (1./Re)*( vxx + vyy + vzz  )
+    L0123[:,:,2] =  -U *wx         -pz + (1./Re)*( wxx + wyy + wzz  )
+    L0123[:,:,3] =   ux + vy + wz
+    
+    return L0123
+
+
+
+def getQuadTerm(state, kxArr, kzArr, 
+        padding=False, padArgs=None,derivs=None,flowDict={}):
+    """ Compute non-linear terms in NSE using inverse Fourier transform followed by Fourier transform (both discrete)
+    Arguments:
+        state: should be shape(2L, M+1, 4, N), or a flattened version, where L+1 is size of kxArr and 2M size of kzArr
+                    Contains Fourier coefficients for modes ordered according to kxArr (first index) and kzArr (second index)
+                    Third index corresponds to variable, going as (u_tilde, v_tilde, w_tilde, p),
+                        where u = (1-y^2)u_tilde, and so on..
+        kxArr: Should contain streamwise wavenumbers
+                    For consistency, should be ordered as alpha*(0,1,2,..,L-1, -L, -L+1,..., -1)
+        kzArr: Should contain spanwise wavenumbers
+                    For consistency, should be ordered as beta*(0,1,2,..,M)
+        padding (=False): If True, pad to L_padded= 2L, M_padded = 2M with zeros
+        padArgs (=None): If not None, must be a dict that specifies  L_padded, M_padded
+    Outputs:
+        dict with keys
+            N0, N1, N2, N3,
+            each a (N,) array
+    """
+    state = state.reshape((kxArr.size, kzArr.size, 4, -1))
+    N = state.shape[-1]
+    if ('y' in flowDict) and ('D1' in flowDict) and ('D2' in flowDict):
+        y = flowDict['y']; D1 = flowDict['D1']; D2 = flowDict['D2']
+    else :
+        y, DM = pseudo.chebdif(N,1)
+        warn("Calling chebdif 1...")
+        D1 = DM[:,:,0]
+    D = D1
+    yQuad = (1.-y**2)
+    
+    alpha = abs(kxArr[1])
+    if kzArr.size == 0 : beta = 0.
+    else : beta = kzArr[1]
+    L = kxArr.size//2; M = kzArr.size - 1
+    # Ensure appropriate ordering of kxArr and kzArr
+    kxArr_required = _kxFun(alpha, L)  # _kxFun, _kzFun defined early in the notebook for global use
+    kzArr_required = _kzFun(beta, M)
+    assert np.allclose(kxArr, kxArr_required) and np.allclose(kzArr, kzArr_required)
+    
+    if padding:
+        if padArgs is not None :
+            Lnew = padArgs.get('L', 2*L)
+            Mnew = padArgs.get('M', 2*M)
+        else : 
+            Lnew = 2*L; Mnew = 2*M
+        Lnew = max(Lnew, L); Mnew = max(Mnew, M)    # For simplicity, don't allow padding to drop modes
+        statePad = np.zeros((2*Lnew, Mnew+1, 4, N),dtype=np.complex)
+        statePad[:L,:M+1] = state[:L, :M+1]
+        statePad[-L:,:M+1] = state[-L:,:M+1]
+        kxArrPad = _kxFun(alpha, Lnew)
+        kzArrPad = _kzFun(beta, Mnew)
+    else :
+        statePad = state
+        kxArrPad = kxArr
+        kzArrPad = kzArr
+        Lnew = L; Mnew = M
+    
+    
+    if derivs is None :
+        xder, yder, zder = calcDerivatives(state, kxArr, kzArr)
+        warn("Calculating derivs in getQuadTerm.")
+    else :
+        xder, yder, zder = derivs
+    
+    def getFields(iField, ix, iz):
+        return xder[ix,iz,0,iField], xder[ix,iz,1,iField], yder[ix,iz,1,iField], zder[ix,iz,1,iField]
+    
+    # 3rd index is order of derivative
+    # last index is for variable, ordered as (u,v,w,p)
+    if True :
+        fullDer = np.concatenate((xder[:,:,:2], yder[:,:,1:2], zder[:,:,1:2]),axis=2)
+        fullPhys = np.fft.irfft2(fullDer, axes=(0,1))*(2*Lnew)*(2*Mnew)
+
+        uPhysical   = fullPhys[:,:,0,0]
+        uPhysical_x = fullPhys[:,:,1,0]
+        uPhysical_y = fullPhys[:,:,2,0] 
+        uPhysical_z = fullPhys[:,:,3,0] 
+        
+        vPhysical   = fullPhys[:,:,0,1]
+        vPhysical_x = fullPhys[:,:,1,1]
+        vPhysical_y = fullPhys[:,:,2,1] 
+        vPhysical_z = fullPhys[:,:,3,1] 
+        
+        wPhysical   = fullPhys[:,:,0,2]
+        wPhysical_x = fullPhys[:,:,1,2]
+        wPhysical_y = fullPhys[:,:,2,2] 
+        wPhysical_z = fullPhys[:,:,3,2] 
+        
+    else :
+        uPhysical   = np.fft.irfft2(xder[:,:,0,0], axes=(0,1))*(2*Lnew)*(2*Mnew)
+        uPhysical_x = np.fft.irfft2(xder[:,:,1,0], axes=(0,1))*(2*Lnew)*(2*Mnew)
+        uPhysical_y = np.fft.irfft2(yder[:,:,1,0], axes=(0,1))*(2*Lnew)*(2*Mnew)
+        uPhysical_z = np.fft.irfft2(zder[:,:,1,0], axes=(0,1))*(2*Lnew)*(2*Mnew)
+        
+        vPhysical   = np.fft.irfft2(xder[:,:,0,1], axes=(0,1))*(2*Lnew)*(2*Mnew)
+        vPhysical_x = np.fft.irfft2(xder[:,:,1,1], axes=(0,1))*(2*Lnew)*(2*Mnew)
+        vPhysical_y = np.fft.irfft2(yder[:,:,1,1], axes=(0,1))*(2*Lnew)*(2*Mnew)
+        vPhysical_z = np.fft.irfft2(zder[:,:,1,1], axes=(0,1))*(2*Lnew)*(2*Mnew)
+        
+        wPhysical   = np.fft.irfft2(xder[:,:,0,2], axes=(0,1))*(2*Lnew)*(2*Mnew)
+        wPhysical_x = np.fft.irfft2(xder[:,:,1,2], axes=(0,1))*(2*Lnew)*(2*Mnew)
+        wPhysical_y = np.fft.irfft2(yder[:,:,1,2], axes=(0,1))*(2*Lnew)*(2*Mnew)
+        wPhysical_z = np.fft.irfft2(zder[:,:,1,2], axes=(0,1))*(2*Lnew)*(2*Mnew)
+        
+    # Now we have physical fields, ready to calculate non-linear terms
+    N0phys = uPhysical*uPhysical_x + vPhysical*uPhysical_y + wPhysical*uPhysical_z
+    N1phys = uPhysical*vPhysical_x + vPhysical*vPhysical_y + wPhysical*vPhysical_z
+    N2phys = uPhysical*wPhysical_x + vPhysical*wPhysical_y + wPhysical*wPhysical_z
+    
+    
+    N0pad = np.fft.rfft2(N0phys, axes=(0,1))/(2*Lnew)/(2*Mnew)
+    N1pad = np.fft.rfft2(N1phys, axes=(0,1))/(2*Lnew)/(2*Mnew)
+    N2pad = np.fft.rfft2(N2phys, axes=(0,1))/(2*Lnew)/(2*Mnew)
+    N3pad = np.zeros(N0pad.shape, dtype=N0pad.dtype)
+    # Finally, revert back to original size 
+    N0123 = np.zeros((2*L,M+1,4,N), dtype=np.complex)
+
+    N0123[:L ,:M+1,0] = N0pad[:L , :M+1]
+    N0123[-L:,:M+1,0] = N0pad[-L:, :M+1]
+
+    N0123[:L ,:M+1,1] = N1pad[:L , :M+1]
+    N0123[-L:,:M+1,1] = N1pad[-L:, :M+1]
+
+    N0123[:L ,:M+1,2] = N2pad[:L , :M+1]
+    N0123[-L:,:M+1,2] = N2pad[-L:, :M+1]
+
+    return N0123
+    
+def NSECostFun(state, kxArr, kzArr, flowDict,
+               padding=True, padArgs=None, zeta=5.,
+               mode=0,wavy=False):
+    """
+        If mode = 0, keep both lin and quad terms
+        If mode = 1, keep only lin term
+        If mode = 2, keep only quad ter
+    """
+    derivs = calcDerivatives(state, kxArr, kzArr, flowDict=flowDict,wavy=wavy)
+    N = flowDict.get('N', state.shape[-1])
+    resids = np.zeros((kxArr.size, kzArr.size, 4, N), dtype=np.complex)
+    if not (mode == 2):
+        resids += getLinTerm(state, kxArr, kzArr, flowDict,derivs=derivs)
+    if not (mode == 1):
+        resids += getQuadTerm(state, kxArr, kzArr, padding=padding, padArgs=padArgs,
+                derivs=derivs, flowDict=flowDict)
+    
+    N = flowDict['U'].size
+    
+    resids[:,:,3] *= np.sqrt(zeta)  # Additional penalty on divergence
+    cost = qnorm(resids,N)
+    return cost
+    
